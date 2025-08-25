@@ -15,10 +15,26 @@ import os
 import json
 from collections import deque
 import sqlite3
+import sys
 
 # Configuration de l'application Flask
 app = Flask(__name__)
 CORS(app)  # Permet les requêtes cross-origin
+
+# Cache pour les prédictions (éviter de retraiter la même image)
+from functools import lru_cache
+import hashlib
+
+# Cache des prédictions récentes
+prediction_cache = {}
+CACHE_SIZE = 100
+
+def get_image_hash(image_data):
+    """Générer un hash de l'image pour le cache"""
+    if isinstance(image_data, str):
+        if 'base64,' in image_data:
+            image_data = image_data.split(',')[1]
+    return hashlib.md5(image_data.encode()).hexdigest()
 
 # Optionnel: tentative d'import de dlib pour les landmarks
 try:
@@ -39,6 +55,8 @@ class SessionDatabase:
         """Initialiser la base de données avec une nouvelle connexion à chaque fois"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        # Table des sessions
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +70,21 @@ class SessionDatabase:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # Table des frames vidéo des sessions
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS session_frames (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER,
+                frame_data TEXT,
+                timestamp REAL,
+                prediction TEXT,
+                confidence REAL,
+                frame_number INTEGER,
+                FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
+            )
+        ''')
+        
         conn.commit()
         conn.close()
 
@@ -84,10 +117,16 @@ class SessionDatabase:
         return sessions
 
     def delete_session(self, session_id):
-        """Supprimer une session"""
+        """Supprimer une session et ses frames associées"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        # Supprimer d'abord les frames associées
+        cursor.execute('DELETE FROM session_frames WHERE session_id = ?', (session_id,))
+        
+        # Puis supprimer la session
         cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
+        
         conn.commit()
         conn.close()
 
@@ -96,6 +135,39 @@ class SessionDatabase:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM sessions')
+        conn.commit()
+        conn.close()
+
+    def insert_frame(self, session_id, frame_data, timestamp, prediction, confidence, frame_number):
+        """Insérer une frame vidéo pour une session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO session_frames (session_id, frame_data, timestamp, prediction, confidence, frame_number)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (session_id, frame_data, timestamp, prediction, confidence, frame_number))
+        conn.commit()
+        conn.close()
+
+    def get_session_frames(self, session_id):
+        """Récupérer toutes les frames d'une session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT frame_data, timestamp, prediction, confidence, frame_number
+            FROM session_frames 
+            WHERE session_id = ? 
+            ORDER BY frame_number ASC
+        ''', (session_id,))
+        frames = cursor.fetchall()
+        conn.close()
+        return frames
+
+    def delete_session_frames(self, session_id):
+        """Supprimer toutes les frames d'une session"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM session_frames WHERE session_id = ?', (session_id,))
         conn.commit()
         conn.close()
 
@@ -129,6 +201,12 @@ class DrowsinessDetector:
         self.prediction_buffer = deque(maxlen=5)
         self.model = MobileNetDrowsiness()
 
+        # Optimisations PyTorch
+        if torch.cuda.is_available():
+            # Mixed precision pour CUDA
+            self.scaler = torch.cuda.amp.GradScaler()
+            print("✅ Mixed precision CUDA activé")
+        
         # Charger les poids
         if os.path.exists(model_path):
             try:
@@ -152,6 +230,14 @@ class DrowsinessDetector:
 
         self.model.to(self.device)
         self.model.eval()
+        
+        # Optimisation : JIT compilation si disponible
+        try:
+            if hasattr(torch, 'jit') and torch.jit.is_available():
+                self.model = torch.jit.optimize_for_inference(torch.jit.script(self.model))
+                print("✅ Modèle optimisé avec TorchScript")
+        except Exception as e:
+            print(f"⚠️ TorchScript non disponible: {e}")
 
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -160,7 +246,30 @@ class DrowsinessDetector:
                                  std=[0.229, 0.224, 0.225])
         ])
 
-        self.detector_face = MTCNN(keep_all=False, device=self.device)
+        # Détection faciale avec fallback
+        self.use_face_detection = True
+        self.use_opencv_fallback = True  # Activer OpenCV par défaut
+        self.use_mtcnn = False  # Désactiver MTCNN par défaut (trop strict)
+        
+        try:
+            if self.use_mtcnn:
+                self.detector_face = MTCNN(
+                    keep_all=False, 
+                    device=self.device,
+                    min_face_size=20,  # Visages plus petits
+                    thresholds=[0.6, 0.7, 0.7],  # Plus permissif
+                    factor=0.8,  # Échelle de pyramide plus fine
+                    post_process=False  # Désactiver le post-processing pour la vitesse
+                )
+                print("✅ MTCNN initialisé avec paramètres optimisés")
+            else:
+                print("🔄 MTCNN désactivé, utilisation d'OpenCV uniquement")
+                self.detector_face = None
+        except Exception as e:
+            print(f"❌ Erreur MTCNN: {e}")
+            print("⚠️ Détection faciale désactivée")
+            self.use_face_detection = False
+            self.detector_face = None
 
         # Optionnel : landmarks avec dlib
         self.use_landmarks = False
@@ -178,17 +287,72 @@ class DrowsinessDetector:
                 print(f"Erreur chargement landmarks : {e}")
 
     def crop_face(self, image_pil):
-        """Détecter et recadrer le visage avec MTCNN"""
+        """Détecter et recadrer le visage avec OpenCV en priorité, MTCNN en fallback"""
         try:
-            face = self.detector_face(image_pil)
-            if face is not None:
-                face = face.permute(1, 2, 0).byte().cpu().numpy()
-                return Image.fromarray(face)
-            else:
-                print("Aucun visage détecté")
-                return image_pil  # fallback
+            print(f"🔍 Tentative détection faciale sur image {image_pil.size}")
+            
+            # Priorité 1 : OpenCV (plus fiable)
+            if self.use_opencv_fallback:
+                try:
+                    import cv2
+                    import numpy as np
+                    
+                    # Convertir PIL en numpy array
+                    img_array = np.array(image_pil)
+                    
+                    # Détecteur de visages OpenCV (plus permissif)
+                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                    
+                    faces = face_cascade.detectMultiScale(
+                        gray, 
+                        scaleFactor=1.1, 
+                        minNeighbors=3, 
+                        minSize=(30, 30)
+                    )
+                    
+                    if len(faces) > 0:
+                        print(f"✅ Visage détecté par OpenCV: {len(faces)} visage(s)")
+                        # Prendre le plus grand visage
+                        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                        face_img = image_pil.crop((x, y, x+w, y+h))
+                        return face_img
+                    else:
+                        print("⚠️ Aucun visage détecté par OpenCV")
+                        
+                except Exception as cv_error:
+                    print(f"⚠️ OpenCV échoué: {cv_error}")
+            
+            # Priorité 2 : MTCNN (si disponible et OpenCV échoue)
+            if self.use_mtcnn and self.use_face_detection and self.detector_face is not None:
+                try:
+                    face = self.detector_face(image_pil)
+                    
+                    if face is not None:
+                        print(f"✅ Visage détecté par MTCNN: {face.shape}")
+                        # Convertir le tensor en image PIL
+                        if hasattr(face, 'permute'):
+                            face = face.permute(1, 2, 0).byte().cpu().numpy()
+                            face_img = Image.fromarray(face)
+                        else:
+                            face_img = face
+                        return face_img
+                    else:
+                        print("⚠️ Aucun visage détecté par MTCNN")
+                        
+                except Exception as mtcnn_error:
+                    print(f"⚠️ MTCNN échoué: {mtcnn_error}")
+            elif not self.use_mtcnn:
+                print("🔄 MTCNN désactivé, passage à l'image complète")
+            
+            # Dernier fallback : retourner l'image complète
+            print("🔄 Aucun visage détecté, utilisation de l'image complète")
+            return image_pil
+                
         except Exception as e:
-            print(f"Erreur crop_face: {e}")
+            print(f"❌ Erreur crop_face: {e}")
+            print(f"🔍 Type d'image: {type(image_pil)}")
+            print(f"🔍 Taille image: {image_pil.size if hasattr(image_pil, 'size') else 'N/A'}")
             return image_pil
 
     def preprocess_image(self, image):
@@ -203,7 +367,12 @@ class DrowsinessDetector:
                 image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
 
             image = image.convert('RGB')
-            image = self.crop_face(image)
+            
+            # Crop face seulement si la détection faciale est activée
+            if self.use_face_detection and self.detector_face is not None:
+                image = self.crop_face(image)
+            else:
+                print("🔄 Détection faciale désactivée, utilisation de l'image complète")
 
             image_tensor = self.transform(image).unsqueeze(0)
             return image_tensor.to(self.device)
@@ -251,10 +420,23 @@ class DrowsinessDetector:
 
     def predict(self, image):
         try:
+            # Vérifier le cache d'abord
+            image_hash = get_image_hash(image)
+            if image_hash in prediction_cache:
+                cached_result = prediction_cache[image_hash]
+                print(f"✅ Cache hit pour image {image_hash[:8]}...")
+                return cached_result
+            
             input_tensor = self.preprocess_image(image)
 
             with torch.no_grad():
-                outputs = self.model(input_tensor)
+                # Utiliser mixed precision si CUDA disponible
+                if torch.cuda.is_available() and hasattr(self, 'scaler'):
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(input_tensor)
+                else:
+                    outputs = self.model(input_tensor)
+                    
                 probability = torch.sigmoid(outputs)
                 confidence_score = probability.item() * 100
                 predicted_class = 'drowsy' if probability.item() > 0.5 else 'awake'
@@ -267,13 +449,24 @@ class DrowsinessDetector:
             final_prediction = 'drowsy' if drowsy_count >= len(recent_predictions) // 2 else 'awake'
             avg_confidence = np.mean([conf for _, conf in recent_predictions])
 
-            return {
+            result = {
                 'prediction': final_prediction,
                 'confidence': round(avg_confidence, 2),
                 'raw_prediction': predicted_class,
                 'raw_confidence': round(confidence_score, 2),
                 'buffer_size': len(self.prediction_buffer)
             }
+            
+            # Mettre en cache le résultat
+            if len(prediction_cache) >= CACHE_SIZE:
+                # Supprimer le plus ancien
+                oldest_key = next(iter(prediction_cache))
+                del prediction_cache[oldest_key]
+            
+            prediction_cache[image_hash] = result
+            print(f"💾 Cache miss, nouvelle prédiction mise en cache")
+
+            return result
 
         except Exception as e:
             print(f"Erreur lors de la prédiction: {e}")
@@ -343,6 +536,21 @@ def index():
                 <p>Supprimer une session spécifique</p>
             </div>
             
+                    <div class="endpoint">
+            <span class="method delete">DELETE</span> <code>/clear_sessions</code>
+            <p>Supprimer toutes les sessions</p>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method get">GET</span> <code>/get_session_frames/&lt;id&gt;</code>
+            <p>Récupérer les frames vidéo d'une session</p>
+        </div>
+        
+        <div class="endpoint">
+            <span class="method post">POST</span> <code>/save_frame</code>
+            <p>Sauvegarder une frame vidéo</p>
+        </div>
+            
             <div class="endpoint">
                 <span class="method get">GET</span> <code>/health</code>
                 <p>Vérifier l'état de l'API</p>
@@ -365,6 +573,8 @@ def index():
 @app.route('/predict', methods=['POST'])
 def predict():
     """Endpoint pour prédire l'état de somnolence"""
+    start_time = datetime.datetime.now()
+    
     try:
         detector = init_detector()
         data = request.get_json()
@@ -378,20 +588,34 @@ def predict():
         # Analyser l'image
         result = detector.predict(data['image'])
         
-        # Ajouter des métadonnées
+        # Calculer la latence
+        end_time = datetime.datetime.now()
+        latency_ms = (end_time - start_time).total_seconds() * 1000
+        
+        # Ajouter des métadonnées de performance
         result.update({
             'success': True,
-            'timestamp': datetime.datetime.now().isoformat(),
-            'device': str(detector.device)
+            'timestamp': start_time.isoformat(),
+            'device': str(detector.device),
+            'latency_ms': round(latency_ms, 2),
+            'cache_size': len(prediction_cache),
+            'model_optimized': hasattr(detector.model, '_get_methods')  # TorchScript
         })
+        
+        # Log de performance
+        print(f"⚡ Prédiction en {latency_ms:.1f}ms (cache: {len(prediction_cache)}/{CACHE_SIZE})")
         
         return jsonify(result)
         
     except Exception as e:
+        end_time = datetime.datetime.now()
+        latency_ms = (end_time - start_time).total_seconds() * 1000
+        
         return jsonify({
             'error': f'Erreur lors de la prédiction: {str(e)}',
             'success': False,
-            'timestamp': datetime.datetime.now().isoformat()
+            'timestamp': start_time.isoformat(),
+            'latency_ms': round(latency_ms, 2)
         }), 500
 
 
@@ -511,6 +735,130 @@ def clear_sessions():
         }), 500
 
 
+@app.route('/get_session_frames/<int:session_id>', methods=['GET'])
+def get_session_frames(session_id):
+    """Récupérer les frames vidéo d'une session"""
+    try:
+        db = SessionDatabase()
+        frames = db.get_session_frames(session_id)
+        
+        # Convertir en format JSON-friendly
+        frames_list = []
+        for frame in frames:
+            frames_list.append({
+                'frame_data': frame[0],  # base64 image
+                'timestamp': frame[1],   # timestamp
+                'prediction': frame[2],  # prediction
+                'confidence': frame[3],  # confidence
+                'frame_number': frame[4] # frame number
+            })
+        
+        return jsonify({
+            'frames': frames_list,
+            'success': True,
+            'session_id': session_id
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': f'Erreur lors de la récupération des frames: {str(e)}',
+            'success': False
+        }), 500
+
+
+@app.route('/save_frame', methods=['POST'])
+def save_frame():
+    """Sauvegarder une frame vidéo"""
+    try:
+        data = request.get_json()
+        
+        # Validation des données
+        required_fields = ['session_id', 'frame_data', 'timestamp', 'prediction', 'confidence', 'frame_number']
+        
+        for field in required_fields:
+            if field not in data:
+                return jsonify({
+                    'error': f'Champ manquant: {field}',
+                    'success': False
+                }), 400
+        
+        frame_data = {
+            'session_id': data['session_id'],
+            'frame_data': data['frame_data'],
+            'timestamp': data['timestamp'],
+            'prediction': data['prediction'],
+            'confidence': data['confidence'],
+            'frame_number': data['frame_number']
+        }
+
+        db = SessionDatabase()
+        db.insert_frame(
+            frame_data['session_id'],
+            frame_data['frame_data'],
+            frame_data['timestamp'],
+            frame_data['prediction'],
+            frame_data['confidence'],
+            frame_data['frame_number']
+        )
+        
+        return jsonify({
+            'message': 'Frame enregistrée avec succès',
+            'success': True
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': f'Erreur lors de la sauvegarde de la frame: {str(e)}',
+            'success': False
+        }), 500
+
+
+@app.route('/performance', methods=['GET'])
+def performance_metrics():
+    """Métriques de performance de l'API"""
+    try:
+        detector = init_detector()
+        
+        # Statistiques du cache
+        cache_stats = {
+            'size': len(prediction_cache),
+            'max_size': CACHE_SIZE,
+            'hit_rate': 0.0,  # À calculer si on garde des stats
+            'memory_usage_mb': len(prediction_cache) * 0.1  # Estimation
+        }
+        
+        # Informations sur le modèle
+        model_info = {
+            'device': str(detector.device),
+            'torchscript_optimized': hasattr(detector.model, '_get_methods'),
+            'mixed_precision': hasattr(detector, 'scaler'),
+            'cuda_available': torch.cuda.is_available(),
+            'model_parameters': sum(p.numel() for p in detector.model.parameters()) if hasattr(detector.model, 'parameters') else 0
+        }
+        
+        # Statistiques système
+        import psutil
+        system_stats = {
+            'cpu_percent': psutil.cpu_percent(interval=1),
+            'memory_percent': psutil.virtual_memory().percent,
+            'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        }
+        
+        return jsonify({
+            'success': True,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'cache': cache_stats,
+            'model': model_info,
+            'system': system_stats
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'error': f'Erreur lors de la récupération des métriques: {str(e)}',
+            'success': False
+        }), 500
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Vérifier l'état de l'API"""
@@ -568,6 +916,79 @@ def model_info():
         }), 500
 
 
+@app.route('/face_detection_test', methods=['POST'])
+def face_detection_test():
+    """Tester la détection faciale sur une image"""
+    try:
+        detector = init_detector()
+        data = request.get_json()
+        
+        if not data or 'image' not in data:
+            return jsonify({
+                'error': 'Image manquante dans la requête',
+                'success': False
+            }), 400
+        
+        # Test de détection faciale
+        image_data = data['image']
+        if 'base64,' in image_data:
+            image_data = image_data.split(',')[1]
+        
+        image_bytes = base64.b64decode(image_data)
+        image_pil = Image.open(io.BytesIO(image_bytes))
+        
+        # Test MTCNN
+        mtcnn_result = None
+        if detector.use_face_detection and detector.detector_face:
+            try:
+                face = detector.detector_face(image_pil)
+                mtcnn_result = {
+                    'detected': face is not None,
+                    'shape': str(face.shape) if face is not None else None
+                }
+            except Exception as e:
+                mtcnn_result = {'error': str(e)}
+        
+        # Test OpenCV fallback
+        opencv_result = None
+        try:
+            import cv2
+            import numpy as np
+            
+            img_array = np.array(image_pil)
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            
+            faces = face_cascade.detectMultiScale(
+                gray, 
+                scaleFactor=1.1, 
+                minNeighbors=3, 
+                minSize=(30, 30)
+            )
+            
+            opencv_result = {
+                'detected': len(faces) > 0,
+                'count': len(faces),
+                'faces': faces.tolist() if len(faces) > 0 else []
+            }
+        except Exception as e:
+            opencv_result = {'error': str(e)}
+        
+        return jsonify({
+            'success': True,
+            'image_size': image_pil.size,
+            'mtcnn': mtcnn_result,
+            'opencv': opencv_result,
+            'face_detection_enabled': detector.use_face_detection
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'error': f'Erreur lors du test: {str(e)}',
+            'success': False
+        }), 500
+
+
 # Gestion des erreurs
 @app.errorhandler(404)
 def not_found(error):
@@ -581,6 +1002,8 @@ def not_found(error):
             'GET /get_sessions',
             'DELETE /delete_session/<id>',
             'DELETE /clear_sessions',
+            'GET /get_session_frames/<id>',
+            'POST /save_frame',
             'GET /health',
             'GET /model_info'
         ]
