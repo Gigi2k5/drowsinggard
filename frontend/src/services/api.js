@@ -7,13 +7,32 @@ export class ApiClient {
 
 	async request(path, options = {}) {
 		const url = `${this.baseUrl}${path}`;
-		const response = await fetch(url, {
-			headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+		
+		// Récupérer le token d'authentification
+		const token = localStorage.getItem('authToken');
+		
+		// Préparer les headers avec authentification si disponible
+		const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+		if (token) {
+			headers['Authorization'] = `Bearer ${token}`;
+		}
+		
+		// Préparer les options de fetch
+		const fetchOptions = {
+			headers,
 			...options
-		});
+		};
+		
+		// Convertir le body en JSON si présent
+		if (options.body && typeof options.body === 'object') {
+			fetchOptions.body = JSON.stringify(options.body);
+		}
+		
+		const response = await fetch(url, fetchOptions);
 		const data = await response.json().catch(() => null);
+		
 		if (!response.ok) {
-			throw new Error((data && (data.error || data.message)) || `HTTP ${response.status}`);
+			throw new Error((data && (data.error || data.message)) || `HTTP ${response.status}: ${response.statusText}`);
 		}
 		return data;
 	}

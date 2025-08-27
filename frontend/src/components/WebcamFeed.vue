@@ -53,6 +53,7 @@ export default {
     const isStreaming = ref(false)
     const currentStatus = ref('awake')
     let stream = null
+    let frameCounter = 0
 
     // Computed properties
     const statusText = computed(() => {
@@ -91,6 +92,14 @@ export default {
         
         if (videoElement.value) {
           videoElement.value.srcObject = stream
+          // Attendre que les métadonnées vidéo soient disponibles pour obtenir des dimensions non nulles
+          await new Promise(resolve => {
+            if (videoElement.value.readyState >= 1 && videoElement.value.videoWidth > 0) {
+              resolve()
+            } else {
+              videoElement.value.onloadedmetadata = () => resolve()
+            }
+          })
           await videoElement.value.play()
           isStreaming.value = true
           emit('update:modelValue', true)
@@ -136,10 +145,20 @@ export default {
           try {
             // Capturer une image de la webcam
             const canvas = document.createElement('canvas')
-            canvas.width = videoElement.value.videoWidth
-            canvas.height = videoElement.value.videoHeight
+            const video = videoElement.value
+            const videoWidth = (video && video.videoWidth) ? video.videoWidth : 640
+            const videoHeight = (video && video.videoHeight) ? video.videoHeight : 480
+
+            // Éviter les captures 1x1 lorsque la vidéo n'est pas prête
+            if (videoWidth < 2 || videoHeight < 2) {
+              console.warn('⏳ Vidéo non prête, capture ignorée (dimensions:', videoWidth, 'x', videoHeight, ')')
+              return
+            }
+
+            canvas.width = videoWidth
+            canvas.height = videoHeight
             const ctx = canvas.getContext('2d')
-            ctx.drawImage(videoElement.value, 0, 0)
+            ctx.drawImage(video, 0, 0, videoWidth, videoHeight)
             
             // Convertir en base64
             const imageData = canvas.toDataURL('image/jpeg', 0.8)
@@ -178,7 +197,7 @@ export default {
                   timestamp: Date.now() / 1000, // timestamp en secondes
                   prediction: newStatus,
                   confidence: response.confidence,
-                  frameNumber: Date.now() // numéro de frame basé sur le timestamp
+                  frameNumber: ++frameCounter // numéro de frame incrémental
                 }
                 
                 console.log('📸 Émission frame-captured:', {

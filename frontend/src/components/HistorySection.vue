@@ -393,6 +393,15 @@
         </div>
         
         <div class="modal-footer">
+          <button 
+            v-if="canExport"
+            @click="exportSessionVideo" 
+            class="btn-export-video" 
+            :disabled="sessionFrames.length === 0 || exportingVideo"
+          >
+            <i class="fas fa-download"></i>
+            {{ exportingVideo ? 'Export en cours...' : 'Exporter la vidéo' }}
+          </button>
           <button @click="closeVideoModal" class="btn-secondary">Fermer</button>
         </div>
       </div>
@@ -406,7 +415,13 @@ import { api } from '../services/api'
 
 export default {
   name: 'HistorySection',
-  setup() {
+  props: {
+    userRole: {
+      type: String,
+      default: 'user'
+    }
+  },
+  setup(props) {
     // État des données
     const sessions = ref([])
     const loading = ref(false)
@@ -420,6 +435,7 @@ export default {
     const isPlaying = ref(false)
     const currentFrameIndex = ref(0)
     const playInterval = ref(null)
+    const exportingVideo = ref(false)
     
     // Filtres
     const dateFilter = ref('7')
@@ -484,6 +500,9 @@ export default {
        })
        return imageData
      })
+    
+    // Computed properties pour les permissions
+    const canExport = computed(() => props.userRole === 'admin')
     
     // Méthodes
     async function loadSessions() {
@@ -662,6 +681,76 @@ export default {
       currentFrameIndex.value = 0
     }
     
+    async function exportSessionVideo() {
+      try {
+        if (!selectedVideoSession.value || sessionFrames.value.length === 0) {
+          alert('Aucune frame à exporter pour cette session')
+          return
+        }
+        exportingVideo.value = true
+        const fps = 10
+        const frameDuration = Math.round(1000 / fps)
+        
+        // Charger la première image pour initialiser le canvas
+        const firstImg = new Image()
+        firstImg.src = sessionFrames.value[0].frame_data
+        await new Promise((resolve, reject) => {
+          firstImg.onload = resolve
+          firstImg.onerror = reject
+        })
+        const width = firstImg.naturalWidth || 640
+        const height = firstImg.naturalHeight || 480
+        
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const ctx = canvas.getContext('2d')
+        
+        // Capture stream + MediaRecorder
+        const stream = canvas.captureStream(fps)
+        const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm'
+        const recorder = new MediaRecorder(stream, { mimeType })
+        const chunks = []
+        recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data) }
+        const stopped = new Promise(resolve => { recorder.onstop = resolve })
+        recorder.start()
+        
+        // Dessiner les frames à la cadence voulue
+        for (let i = 0; i < sessionFrames.value.length; i++) {
+          const img = new Image()
+          img.src = sessionFrames.value[i].frame_data
+          // Attendre le chargement
+          /* eslint-disable no-await-in-loop */
+          await new Promise((resolve, reject) => {
+            img.onload = resolve
+            img.onerror = reject
+          })
+          ctx.drawImage(img, 0, 0, width, height)
+          await new Promise(resolve => setTimeout(resolve, frameDuration))
+        }
+        
+        recorder.stop()
+        await stopped
+        
+        const blob = new Blob(chunks, { type: 'video/webm' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `session_${selectedVideoSession.value.id}.webm`
+        document.body.appendChild(a)
+        a.click()
+        setTimeout(() => {
+          URL.revokeObjectURL(url)
+          document.body.removeChild(a)
+        }, 0)
+      } catch (err) {
+        console.error('❌ Erreur export vidéo:', err)
+        alert("Erreur lors de l'export de la vidéo. Consultez la console.")
+      } finally {
+        exportingVideo.value = false
+      }
+    }
+    
          function seekToFrame() {
        // La fonction est automatiquement appelée par v-model sur le slider
        // Pas besoin de logique supplémentaire
@@ -825,6 +914,7 @@ export default {
       avgConfidence,
       currentFrame,
       currentFrameImage,
+      canExport,
       
       // Méthodes
       loadSessions,
@@ -843,6 +933,8 @@ export default {
       playVideo,
       pauseVideo,
       stopVideo,
+      exportingVideo,
+      exportSessionVideo,
              seekToFrame,
        onImageLoad,
        onImageError,
