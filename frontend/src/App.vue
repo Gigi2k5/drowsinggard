@@ -2,14 +2,14 @@
   <div id="app">
     <!-- Modal d'authentification -->
     <AuthModal 
-      v-if="!isAuthenticated" 
-      :show="!isAuthenticated"
+      v-if="showAuthModal" 
+      :show="showAuthModal"
       @close="showAuthModal = false"
       @login-success="handleLoginSuccess"
     />
     
-    <!-- Navigation principale -->
-    <nav class="navbar">
+    <!-- Navigation principale (visible seulement après authentification) -->
+    <nav class="navbar" v-if="isAuthenticated">
       <div class="nav-container">
         <div class="nav-brand">
           <i class="fas fa-shield-alt"></i>
@@ -73,8 +73,11 @@
 
     <!-- Contenu principal -->
     <main class="main-content">
+      <!-- Page d'accueil (avant authentification) -->
+      <LandingHero v-if="!isAuthenticated" @open-auth="openAuth" />
+
       <!-- Contenu pour utilisateurs normaux -->
-      <template v-if="currentUser?.role !== 'admin'">
+      <template v-if="isAuthenticated && currentUser?.role !== 'admin'">
         <!-- Onglet Surveillance -->
         <div v-if="activeTab === 'monitor'" class="tab-content">
           <div class="monitor-container">
@@ -289,6 +292,7 @@ import AdminPanel from './components/AdminPanel.vue'
 import PerformanceMonitor from './components/PerformanceMonitor.vue'
 import AuthModal from './components/AuthModal.vue'
 import { api } from './services/api'
+import LandingHero from './components/LandingHero.vue'
 
 export default {
   name: 'App',
@@ -297,7 +301,8 @@ export default {
      HistorySection,
      AdminPanel,
      PerformanceMonitor,
-     AuthModal
+     AuthModal,
+     LandingHero
    },
   setup() {
     // État de l'authentification
@@ -377,7 +382,7 @@ export default {
         }
       } else {
         isAuthenticated.value = false
-        showAuthModal.value = true
+        showAuthModal.value = false
         activeTab.value = 'monitor'
       }
     }
@@ -423,7 +428,7 @@ export default {
       localStorage.removeItem('user')
       currentUser.value = null
       isAuthenticated.value = false
-      showAuthModal.value = true
+      showAuthModal.value = false
       
       // Réinitialiser l'état
       stopSession()
@@ -725,6 +730,10 @@ export default {
         day: 'numeric'
       })
     }
+
+    function openAuth() {
+      showAuthModal.value = true
+    }
     
     return {
       // Authentification
@@ -754,6 +763,7 @@ export default {
        AdminPanel,
        PerformanceMonitor,
        AuthModal,
+       LandingHero,
       
       // Méthodes
       handleLoginSuccess,
@@ -769,7 +779,8 @@ export default {
        handleCustomAudioUpload,
        removeCustomAudio,
        formatDuration,
-       formatDate
+       formatDate,
+       openAuth
     }
   }
 }

@@ -62,12 +62,6 @@
             </button>
           </p>
         </div>
-        
-        <div v-if="isLogin" class="demo-credentials">
-          <p class="demo-title">Compte de démonstration :</p>
-          <p><strong>Admin:</strong> admin / admin123</p>
-          <p><strong>Utilisateur:</strong> user / user123</p>
-        </div>
       </div>
     </div>
   </div>
