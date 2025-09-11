@@ -47,6 +47,17 @@
               placeholder="Entrez votre mot de passe"
             />
           </div>
+
+          <div v-if="!isLogin" class="form-group">
+            <label for="confirmPassword">Confirmer le mot de passe</label>
+            <input 
+              id="confirmPassword"
+              v-model="form.confirmPassword"
+              type="password"
+              required
+              placeholder="Retapez votre mot de passe"
+            />
+          </div>
           
           <button type="submit" class="btn-submit" :disabled="loading">
             <i v-if="loading" class="fas fa-spinner fa-spin"></i>
@@ -88,7 +99,8 @@ export default {
     const form = reactive({
       username: '',
       email: '',
-      password: ''
+      password: '',
+      confirmPassword: ''
     })
     
     function closeModal() {
@@ -102,6 +114,7 @@ export default {
       form.username = ''
       form.email = ''
       form.password = ''
+      form.confirmPassword = ''
     }
     
     async function handleSubmit() {
@@ -131,6 +144,14 @@ export default {
           }
         } else {
           // Création de compte
+          if (!form.password || !form.confirmPassword) {
+            error.value = 'Veuillez saisir et confirmer votre mot de passe'
+            return
+          }
+          if (form.password !== form.confirmPassword) {
+            error.value = 'Les mots de passe ne correspondent pas'
+            return
+          }
           const response = await api.request('/auth/register', {
             method: 'POST',
             body: {
@@ -147,6 +168,7 @@ export default {
             form.username = ''
             form.email = ''
             form.password = ''
+            form.confirmPassword = ''
             alert('Compte créé avec succès ! Vous pouvez maintenant vous connecter.')
           } else {
             error.value = response.error || 'Erreur lors de la création du compte'
