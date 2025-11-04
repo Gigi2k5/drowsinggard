@@ -343,6 +343,19 @@
                 <i class="fas fa-stop"></i>
                 Stop
               </button>
+              <div class="speed-control">
+                <label for="playback-speed">
+                  <i class="fas fa-tachometer-alt"></i>
+                  Vitesse:
+                </label>
+                <select id="playback-speed" v-model="playbackSpeed" class="speed-selector">
+                  <option value="0.25">0.25x (Très lent)</option>
+                  <option value="0.5">0.5x (Lent)</option>
+                  <option value="1">1x (Normal)</option>
+                  <option value="2">2x (Rapide)</option>
+                  <option value="4">4x (Très rapide)</option>
+                </select>
+              </div>
               <div class="progress-container">
                 <input 
                   type="range" 
@@ -436,6 +449,7 @@ export default {
     const currentFrameIndex = ref(0)
     const playInterval = ref(null)
     const exportingVideo = ref(false)
+    const playbackSpeed = ref(0.5) // Vitesse par défaut: 0.5x (lent)
     
     // Filtres
     const dateFilter = ref('7')
@@ -655,13 +669,19 @@ export default {
       if (sessionFrames.value.length === 0) return
       
       isPlaying.value = true
+      
+      // Calculer l'intervalle basé sur la vitesse sélectionnée
+      // Base: 250ms (4 FPS) pour vitesse 1x
+      const baseInterval = 250
+      const interval = baseInterval / parseFloat(playbackSpeed.value)
+      
       playInterval.value = setInterval(() => {
         if (currentFrameIndex.value < sessionFrames.value.length - 1) {
           currentFrameIndex.value++
         } else {
           stopVideo()
         }
-      }, 100) // 10 FPS pour la lecture
+      }, interval)
     }
     
     function pauseVideo() {
@@ -900,6 +920,7 @@ export default {
       videoError,
       isPlaying,
       currentFrameIndex,
+      playbackSpeed,
       dateFilter,
       statusFilter,
       limitFilter,
@@ -1691,6 +1712,44 @@ export default {
 .btn-control:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.speed-control {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: #374151;
+  border-radius: 8px;
+}
+
+.speed-control label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  color: #9ca3af;
+  font-weight: 600;
+}
+
+.speed-selector {
+  padding: 0.5rem;
+  background: #1f2937;
+  color: white;
+  border: 1px solid #4b5563;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.875rem;
+  outline: none;
+}
+
+.speed-selector:hover {
+  border-color: #4f9eff;
+}
+
+.speed-selector:focus {
+  border-color: #4f9eff;
+  box-shadow: 0 0 0 3px rgba(79, 158, 255, 0.1);
 }
 
 .progress-container {

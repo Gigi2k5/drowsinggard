@@ -91,6 +91,10 @@
             <WebcamFeed 
               v-model="isStreaming"
               :session-id="currentSessionId"
+              :threshold="0.55"
+              :buffer-size="5"
+              :alert-debounce-seconds="2"
+              :warm-up-frames="3"
               @client-session-created="handleClientSessionCreated"
               @status-update="handleWebcamStatus"
               @alert-detected="handleAlertDetected"
