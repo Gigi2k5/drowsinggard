@@ -91,6 +91,7 @@
             <WebcamFeed 
               v-model="isStreaming"
               :session-id="currentSessionId"
+              @client-session-created="handleClientSessionCreated"
               @status-update="handleWebcamStatus"
               @alert-detected="handleAlertDetected"
               @prediction-update="handlePredictionUpdate"
@@ -435,6 +436,12 @@ export default {
       activeTab.value = 'monitor'
     }
     
+    // Fonction pour recevoir le clientSessionId généré par WebcamFeed
+    function handleClientSessionCreated(clientSessionId) {
+      console.log('🔑 Réception du clientSessionId depuis WebcamFeed:', clientSessionId)
+      currentSessionId.value = clientSessionId
+    }
+    
     // Fonctions de surveillance
     function handleWebcamStatus(status) {
       console.log('Statut webcam:', status)
@@ -447,8 +454,8 @@ export default {
     }
     
     function startSession() {
-      console.log('🚀 Nouvelle session démarrée avec l\'ID:', Date.now())
-      currentSessionId.value = Date.now()
+      console.log('🚀 Nouvelle session démarrée avec client_session_id:', currentSessionId.value)
+      // currentSessionId est maintenant défini par handleClientSessionCreated
       sessionStartTime.value = Date.now()
       alertCount.value = 0
       avgLatency.value = 0
@@ -541,21 +548,12 @@ export default {
       }
       
       try {
-        const response = await api.request('/save_frame', {
-          method: 'POST',
-          body: {
-            session_id: null,
-            client_session_id: frameData.sessionId,
-            frame_data: frameData.frameData,
-            prediction: frameData.prediction,
-            confidence: frameData.confidence,
-            timestamp: frameData.timestamp,
-            frame_number: frameData.frameNumber
-          }
-        })
+        // frameData est déjà au format snake_case (session_id, frame_data, etc.) depuis WebcamFeed
+        // On l'envoie directement sans remapper
+        const response = await api.saveFrame(frameData)
         
         if (response.success) {
-          console.log('✅ Frame enregistrée avec succès pour la session', frameData.sessionId)
+          console.log('✅ Frame enregistrée avec succès')
         } else {
           console.error('❌ Erreur enregistrement frame:', response.error)
         }
@@ -769,6 +767,7 @@ export default {
       handleLoginSuccess,
       changeTab,
       logout,
+      handleClientSessionCreated,
       handleWebcamStatus,
       handleAlertDetected,
       handlePredictionUpdate,

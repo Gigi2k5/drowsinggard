@@ -37,12 +37,29 @@ export class ApiClient {
 		return data;
 	}
 
-	predict(image) {
-		return this.request('/predict', { method: 'POST', body: JSON.stringify({ image }) });
+	/**
+	 * Predict endpoint.
+	 * image: base64 string
+	 * options: optional object { threshold: number, buffer_size: number }
+	 */
+	predict(image, options = {}) {
+		const body = { image };
+		if (options.threshold !== undefined) body.threshold = options.threshold;
+		if (options.buffer_size !== undefined) body.buffer_size = options.buffer_size;
+		return this.request('/predict', { method: 'POST', body });
 	}
 
 	saveSession(session) {
 		return this.request('/save_session', { method: 'POST', body: JSON.stringify(session) });
+	}
+
+	/**
+	 * Save a captured frame to the backend.
+	 * frame should be an object containing at least:
+	 * { frame_data, timestamp, prediction, confidence, frame_number, session_id(optional), client_session_id(optional) }
+	 */
+	saveFrame(frame) {
+		return this.request('/save_frame', { method: 'POST', body: frame });
 	}
 
 	getSessions(limit = 10) {

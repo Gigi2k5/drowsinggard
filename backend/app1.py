@@ -71,7 +71,7 @@ class SessionDatabase:
                 drowsy_count INTEGER,
                 alert_count INTEGER,
                 avg_confidence REAL,
-                client_session_id INTEGER,
+                client_session_id TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -81,7 +81,7 @@ class SessionDatabase:
         except Exception:
             pass
         try:
-            cursor.execute('ALTER TABLE sessions ADD COLUMN client_session_id INTEGER')
+            cursor.execute('ALTER TABLE sessions ADD COLUMN client_session_id TEXT')
         except Exception:
             pass
         
@@ -91,7 +91,7 @@ class SessionDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER,
                 user_id INTEGER DEFAULT 1,
-                client_session_id INTEGER,
+                client_session_id TEXT,
                 frame_data TEXT,
                 timestamp REAL,
                 prediction TEXT,
@@ -106,7 +106,7 @@ class SessionDatabase:
         except Exception:
             pass
         try:
-            cursor.execute('ALTER TABLE session_frames ADD COLUMN client_session_id INTEGER')
+            cursor.execute('ALTER TABLE session_frames ADD COLUMN client_session_id TEXT')
         except Exception:
             pass
         
@@ -402,9 +402,9 @@ class DrowsinessDetector:
                 self.detector_face = None
         except Exception as e:
             print(f"❌ Erreur MTCNN: {e}")
-            print("⚠️ Détection faciale désactivée")
-            self.use_face_detection = False
+            print("⚠️ MTCNN désactivé, fallback vers OpenCV")
             self.detector_face = None
+            # Ne pas désactiver use_face_detection car OpenCV est disponible en fallback
 
         # Optionnel : landmarks avec dlib
         self.use_landmarks = False
@@ -503,8 +503,8 @@ class DrowsinessDetector:
 
             image = image.convert('RGB')
             
-            # Crop face seulement si la détection faciale est activée
-            if self.use_face_detection and self.detector_face is not None:
+            # Crop face: utiliser OpenCV (toujours disponible) ou MTCNN
+            if self.use_face_detection:
                 image = self.crop_face(image)
             else:
                 print("🔄 Détection faciale désactivée, utilisation de l'image complète")
@@ -553,7 +553,7 @@ class DrowsinessDetector:
         except:
             return 0
 
-    def predict(self, image):
+    def predict(self, image, threshold: float = 0.5, buffer_size: int = None):
         try:
             # Vérifier le cache d'abord
             image_hash = get_image_hash(image)
@@ -573,23 +573,38 @@ class DrowsinessDetector:
                     outputs = self.model(input_tensor)
                     
                 probability = torch.sigmoid(outputs)
-                confidence_score = probability.item() * 100
-                predicted_class = 'drowsy' if probability.item() > 0.5 else 'awake'
+                prob_value = float(probability.item())
+                confidence_score = prob_value * 100
+                # Utiliser le seuil fourni (par défaut 0.5)
+                predicted_class = 'drowsy' if prob_value > float(threshold) else 'awake'
 
+            # Stocker la prédiction brute dans le buffer interne
             self.prediction_buffer.append((predicted_class, confidence_score))
 
+            # Construire la fenêtre de décision en respectant buffer_size si fourni
             recent_predictions = list(self.prediction_buffer)
+            if buffer_size is not None:
+                try:
+                    bsize = int(buffer_size)
+                    if bsize > 0:
+                        recent_predictions = recent_predictions[-bsize:]
+                except Exception:
+                    pass
+
             drowsy_count = sum(1 for pred, _ in recent_predictions if pred == 'drowsy')
 
+            # Décision finale : majorité simple sur la fenêtre
             final_prediction = 'drowsy' if drowsy_count >= len(recent_predictions) // 2 else 'awake'
-            avg_confidence = np.mean([conf for _, conf in recent_predictions])
+            avg_confidence = np.mean([conf for _, conf in recent_predictions]) if recent_predictions else confidence_score
 
             result = {
                 'prediction': final_prediction,
                 'confidence': round(avg_confidence, 2),
                 'raw_prediction': predicted_class,
                 'raw_confidence': round(confidence_score, 2),
-                'buffer_size': len(self.prediction_buffer)
+                'buffer_size': len(self.prediction_buffer),
+                'used_threshold': float(threshold),
+                'used_window': len(recent_predictions)
             }
             
             # Mettre en cache le résultat
@@ -939,9 +954,12 @@ def predict():
                 'error': 'Image manquante dans la requête',
                 'success': False
             }), 400
-        
-        # Analyser l'image
-        result = detector.predict(data['image'])
+        # Extraire options optionnelles
+        threshold = data.get('threshold', 0.5)
+        buffer_size = data.get('buffer_size', None)
+
+        # Analyser l'image (possibilité d'overrider threshold et buffer_size par requête)
+        result = detector.predict(data['image'], threshold=threshold, buffer_size=buffer_size)
         
         # Calculer la latence
         end_time = datetime.now()
@@ -954,7 +972,9 @@ def predict():
             'device': str(detector.device),
             'latency_ms': round(latency_ms, 2),
             'cache_size': len(prediction_cache),
-            'model_optimized': hasattr(detector.model, '_get_methods')  # TorchScript
+            'model_optimized': hasattr(detector.model, '_get_methods'),  # TorchScript
+            'used_threshold': float(threshold) if threshold is not None else None,
+            'used_buffer_size': int(buffer_size) if buffer_size is not None else None
         })
         
         # Log de performance
@@ -1016,14 +1036,18 @@ def save_session():
             try:
                 conn = sqlite3.connect(db.db_path)
                 cursor = conn.cursor()
-                # Mettre à jour les frames ayant ce client_session_id et session_id NULL
+                
+                # Mapper les frames avec ce client_session_id vers le nouveau session_id
+                # Cas 1: session_id est NULL ou 0 (frames orphelines normales)
                 cursor.execute('''
                     UPDATE session_frames
                     SET session_id = ?
-                    WHERE client_session_id = ? AND (
-                        session_id IS NULL OR session_id = 0 OR session_id = ?
-                    )
-                ''', (new_session_id, client_session_id, client_session_id))
+                    WHERE client_session_id = ? AND (session_id IS NULL OR session_id = 0)
+                ''', (new_session_id, client_session_id))
+                
+                updated_count = cursor.rowcount
+                print(f"✅ {updated_count} frames liées à la session {new_session_id} via client_session_id={client_session_id}")
+                
                 conn.commit()
                 conn.close()
             except Exception as e:
@@ -1244,36 +1268,68 @@ def save_frame():
     """Sauvegarder une frame vidéo"""
     try:
         data = request.get_json()
-        
-        # Validation des données
-        required_fields = ['frame_data', 'timestamp', 'prediction', 'confidence', 'frame_number']
-        
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    'error': f'Champ manquant: {field}',
-                    'success': False
-                }), 400
-        
-        # session_id peut être null au moment de la capture; on accepte alors client_session_id
-        session_id = data.get('session_id')
-        client_session_id = data.get('client_session_id')
-        
+        # Log brut pour debug en cas d'erreur (n'affiche pas de secrets)
+        try:
+            print(f"/save_frame payload keys: {list(data.keys()) if isinstance(data, dict) else 'non-dict'}")
+        except Exception:
+            print("/save_frame: impossible d'afficher les clés de la payload")
+
+        # Accept both snake_case and camelCase from clients to be tolerant
+        def pick(d, *names):
+            for n in names:
+                if isinstance(d, dict) and n in d:
+                    return d[n]
+            return None
+
+        # Validation des données: accepter frame_data|frameData, timestamp, prediction, confidence, frame_number|frameNumber
+        required_fields = [
+            (('frame_data', 'frameData'), 'frame_data'),
+            (('timestamp',), 'timestamp'),
+            (('prediction',), 'prediction'),
+            (('confidence',), 'confidence'),
+            (('frame_number', 'frameNumber'), 'frame_number')
+        ]
+
+        normalized = {}
+        missing = []
+        for names, out_key in required_fields:
+            val = None
+            for n in names:
+                if isinstance(data, dict) and n in data:
+                    val = data[n]
+                    break
+            if val is None:
+                missing.append(out_key)
+            else:
+                normalized[out_key] = val
+
+        # session_id can be provided as session_id or sessionId
+        session_id = pick(data, 'session_id', 'sessionId')
+        client_session_id = pick(data, 'client_session_id', 'clientSessionId')
+
+        if missing:
+            return jsonify({
+                'error': f'Champ(s) manquant(s): {", ".join(missing)}',
+                'received_keys': list(data.keys()) if isinstance(data, dict) else None,
+                'success': False
+            }), 400
+
         if not session_id and not client_session_id:
             return jsonify({
                 'error': 'session_id ou client_session_id requis',
+                'received_keys': list(data.keys()) if isinstance(data, dict) else None,
                 'success': False
             }), 400
-        
+
         frame_data = {
             'session_id': session_id,
             'user_id': request.current_user['id'],
             'client_session_id': client_session_id,
-            'frame_data': data['frame_data'],
-            'timestamp': data['timestamp'],
-            'prediction': data['prediction'],
-            'confidence': data['confidence'],
-            'frame_number': data['frame_number']
+            'frame_data': normalized['frame_data'],
+            'timestamp': normalized['timestamp'],
+            'prediction': normalized['prediction'],
+            'confidence': normalized['confidence'],
+            'frame_number': normalized['frame_number']
         }
 
         db = SessionDatabase()
